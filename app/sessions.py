@@ -39,6 +39,16 @@ same committed snapshot, so concurrent modification of either session ends in
 either accepting that exact complete outcome or answering 409 — acceptance,
 execution and protocol replacement on one target version are mutually
 exclusive. Any failure raises before commit and leaves both sessions untouched.
+
+Two sessions (which may share one id or carry different protocols) can also be
+compared read-only: each trace is replayed under its own current protocol and
+split into the A->B and B->A directions preserving each direction's original
+order, and only the ``(action, message)`` pairs are compared — transition ids,
+endpoint states/queues and the interleaving between the two directions are
+ignored. Both rows are read in one ``BEGIN IMMEDIATE`` transaction, so a
+concurrent execution, protocol replacement or adoption can only yield the
+comparison of the two complete named versions or a 409 naming the stale side;
+the comparison writes nothing and consumes no version.
 """
 
 import json
@@ -369,6 +379,168 @@ def adopt_trace(
         raise
     finally:
         connection.close()
+
+
+def compare_traces(
+    left_session_id: str,
+    right_session_id: str,
+    left_expected_version: int,
+    right_expected_version: int,
+) -> dict:
+    """Compare the two sessions' replayed traces direction by direction.
+
+    Each trace is replayed against its own stored protocol revision; only the
+    ordered ``(action, message)`` pairs are compared, split into the A->B and
+    B->A directions while preserving their original order within each
+    direction. Transition ids, endpoint states/queues and the interleaving
+    between the two directions are ignored. The two sessions may share one id
+    or carry completely different protocols.
+
+    Both rows are read inside one ``BEGIN IMMEDIATE`` transaction, so the two
+    version checks and both replays observe one single committed snapshot: when
+    either session is modified concurrently (an execution, a protocol
+    replacement or an adoption), the request either compares the complete
+    traces of the two named versions or is rejected as stale. Nothing is ever
+    written and no version is consumed.
+    """
+    same_session = left_session_id == right_session_id
+    connection = _connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        left_row = _select_row(connection, left_session_id)
+        right_row = (
+            left_row
+            if same_session
+            else _select_row(connection, right_session_id)
+        )
+
+        left_version, left_protocol, left_trace_ids = left_row
+        right_version, right_protocol, right_trace_ids = right_row
+
+        if left_version != left_expected_version:
+            raise _version_conflict(
+                left_version, session="left", session_id=left_session_id
+            )
+        if right_version != right_expected_version:
+            # Same id: the single stored version must equal both expectations;
+            # a mismatch on the second one is still reported as "right".
+            raise _version_conflict(
+                right_version, session="right", session_id=right_session_id
+            )
+
+        return {
+            "left_session_id": left_session_id,
+            "right_session_id": right_session_id,
+            "left_version": left_version,
+            "right_version": right_version,
+            "directions": {
+                direction: _compare_direction(
+                    _direction_events(left_protocol, left_trace_ids, direction),
+                    _direction_events(right_protocol, right_trace_ids, direction),
+                )
+                for direction in ("A_to_B", "B_to_A")
+            },
+        }
+    except BaseException:
+        # Read-only request; the rollback only releases the lock early.
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _select_row(connection, session_id: str):
+    row = connection.execute(
+        "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    version, protocol_text, trace_text = row
+    return (
+        version,
+        DeadlockRequest.model_validate(json.loads(protocol_text)),
+        json.loads(trace_text),
+    )
+
+
+def _direction_events(protocol, trace_ids: list[str], direction: str) -> list[dict]:
+    """Replay the trace under the protocol and keep one direction's events.
+
+    The events preserve the order they had in the original trace; interleaving
+    with the other direction is discarded. The stored traces are assumed valid
+    for their stored protocols, so no enablement checks are needed.
+    """
+    model = build_model(protocol)
+    by_id = {transition.id: transition for transition in model.transitions}
+    events = []
+    for index, transition_id in enumerate(trace_ids, start=1):
+        transition = by_id[transition_id]
+        if f"{transition.sender}_to_{transition.receiver}" == direction:
+            events.append(
+                {
+                    "index": index,
+                    "transition_id": transition.id,
+                    "action": transition.action,
+                    "message": transition.message,
+                }
+            )
+    return events
+
+
+def _compare_direction(left_events: list[dict], right_events: list[dict]) -> dict:
+    """Compare ordered (action, message) pairs in one direction."""
+    for position, (left_event, right_event) in enumerate(
+        zip(left_events, right_events), start=1
+    ):
+        if (
+            left_event["action"] != right_event["action"]
+            or left_event["message"] != right_event["message"]
+        ):
+            return {
+                "left_event_count": len(left_events),
+                "right_event_count": len(right_events),
+                "result": "divergent",
+                "first_difference": _difference(position, left_event, right_event),
+            }
+
+    left_count, right_count = len(left_events), len(right_events)
+    if left_count == right_count:
+        result, difference = "equal", None
+    elif left_count < right_count:
+        result = "left_prefix"
+        difference = _difference(
+            left_count + 1, None, right_events[left_count]
+        )
+    else:
+        result = "right_prefix"
+        difference = _difference(
+            right_count + 1, left_events[right_count], None
+        )
+    return {
+        "left_event_count": left_count,
+        "right_event_count": right_count,
+        "result": result,
+        "first_difference": difference,
+    }
+
+
+def _difference(position: int, left_event, right_event) -> dict:
+    return {
+        "position": position,
+        "left_event": None if left_event is None else {
+            "action": left_event["action"], "message": left_event["message"]
+        },
+        "right_event": None if right_event is None else {
+            "action": right_event["action"], "message": right_event["message"]
+        },
+        "left_step": None if left_event is None else {
+            "index": left_event["index"], "transition_id": left_event["transition_id"]
+        },
+        "right_step": None if right_event is None else {
+            "index": right_event["index"], "transition_id": right_event["transition_id"]
+        },
+    }
 
 
 def _update_session(session_id: str, mutate) -> dict:

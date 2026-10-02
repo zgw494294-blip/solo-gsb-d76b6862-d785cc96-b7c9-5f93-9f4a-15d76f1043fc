@@ -592,6 +592,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `PUT` | `/v1/sessions/{id}/protocol` | 替换完整协议，请求体 `{"protocol": {...}, "expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/branches` | 从指定轨迹位置另开分支会话，请求体 `{"expected_version": ..., "prefix_length": ...}`，返回新会话视图（版本 0） |
 | `POST` | `/v1/sessions/{id}/adoptions` | 把来源会话的后续轨迹接回本目标会话，请求体 `{"source_session_id": ..., "target_expected_version": ..., "source_expected_version": ...}` |
+| `POST` | `/v1/trace-comparisons` | 按方向对比两个会话的重放轨迹（只读），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}`，详见下文「两次演练轨迹对比」 |
 
 响应均为同一会话视图：
 
@@ -964,7 +965,211 @@ curl -s http://localhost:8000/v1/sessions/$EMPTY \
 
 与来源会话自身的修改并发时，每个接回要么读到来源指定版本的完整快照（接纳其全部剩余轨迹），要么以 `session: "source"` 返回 `409`，响应绝不会混入来源随后提交的步骤。
 
-### 存储位置与卷保留规则
+### 两次演练轨迹对比：`POST /v1/trace-comparisons`
+
+把**两次演练**放在一起对比，区分「消息交换本身的变化」与「两个方向之间交错次序的差异」。接口接收左、右两个会话 ID 及各自的预期版本（两边可以是**同一个会话 ID**，也可以携带**不同的当前协议**），在服务端按各自**当前协议**重放指定版本的完整轨迹，再把每一步的 `action` 与 `message` 按方向分成 **A→B** 与 **B→A** 两组：
+
+- 每个方向内**保留事件在原轨迹中的先后顺序**，但**忽略两个方向之间的交错**；
+- 比较只看每步的 `action`（`send`/`receive`）与 `message` 两项；
+- **忽略**转移 ID（两边可同 ID 不同定义，也可不同 ID）、执行后的端点状态/队列等一切其他字段；
+- 因此仅交错次序不同的两次演练，两个方向都判为相同。
+
+请求体：
+
+```json
+{
+  "left_session_id": "...",
+  "right_session_id": "...",
+  "left_expected_version": 4,
+  "right_expected_version": 4
+}
+```
+
+每个方向返回双方事件数与判定结果 `result`：
+
+- `equal`：两边逐事件相同（含两边皆空）；
+- `left_prefix`：左边是右边的**严格前缀**（左边更短且共享位置全部相同）；
+- `right_prefix`：右边是左边的**严格前缀**；
+- `divergent`：共享前缀之后某个位置的 `(action, message)` 不同。
+
+相同（`equal`）时 `first_difference` 为 `null`；否则给出**从 1 计**的首个差异位置，以及该位置双方事件 `{action, message}`、双方在各自原轨迹中的步号与转移 ID（`{index, transition_id}`），缺失一侧（严格前缀情形）相应字段为 `null`。响应还回显实际使用的左、右会话 ID 与版本。**接口只读**：不修改任何数据、不消耗任何版本。
+
+两个会话的读取与版本校验在**同一个 `BEGIN IMMEDIATE` 事务**内、针对**同一份已提交快照**完成。与任一会话的执行转移、协议替换或轨迹接回并发时，请求要么对比两个指定版本的**完整轨迹**，要么按过期返回 `409`，并在 `detail` 中以 `session`（`"left"`/`"right"`）、`session_id` 与 `current_version` 指出过期侧；未知会话返回 `404`（`{"detail":"unknown session"}`）。请求体缺字段、空 ID、负版本或含未定义字段时返回 `422`。
+
+### 可执行对比示例（端口 8000）
+
+下面的协议里，A 发 `m`、B 发 `n` 是初始配置下两个互相独立的发送，因此
+`[a1, b2, b1, a2]` 与 `[b2, a1, a2, b1]` 是两条**仅交错次序不同**的完整轨迹：
+
+```bash
+PROTO='{
+  "A": { "states": [0, 1, 2], "initial": 0, "finals": [2] },
+  "B": { "states": [0, 1, 2], "initial": 0, "finals": [2] },
+  "transitions": [
+    { "id": "a1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "a2", "from": "B", "to": "A", "action": "receive", "message": "n", "source": 1, "target": 2 },
+    { "id": "b1", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 1, "target": 2 },
+    { "id": "b2", "from": "B", "to": "A", "action": "send",    "message": "n", "source": 0, "target": 1 }
+  ]
+}'
+
+# 左会话：先发 m，再发 n
+L=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for step in 'a1 0' 'b2 1' 'b1 2' 'a2 3'; do set -- $step
+  curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$L/transitions \
+    -H 'Content-Type: application/json' \
+    -d "{\"transition_id\": \"$1\", \"expected_version\": $2}"; done
+
+# 右会话：先发 n，再发 m（同样的交换，相反的交错）
+R=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for step in 'b2 0' 'a1 1' 'a2 2' 'b1 3'; do set -- $step
+  curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$R/transitions \
+    -H 'Content-Type: application/json' \
+    -d "{\"transition_id\": \"$1\", \"expected_version\": $2}"; done
+
+echo "left=$L right=$R"
+```
+
+对比两个版本均为 `4` 的会话——交错不同，但每个方向的消息交换完全一致，两边都 `equal`：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/trace-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\": \"$L\", \"right_session_id\": \"$R\", \
+\"left_expected_version\": 4, \"right_expected_version\": 4}"
+```
+
+```json
+{
+  "left_session_id": "…左…",
+  "right_session_id": "…右…",
+  "left_version": 4,
+  "right_version": 4,
+  "directions": {
+    "A_to_B": { "left_event_count": 2, "right_event_count": 2, "result": "equal", "first_difference": null },
+    "B_to_A": { "left_event_count": 2, "right_event_count": 2, "result": "equal", "first_difference": null }
+  }
+}
+```
+
+严格前缀：右会话只走了第一步 `a1`（版本 `1`），两个方向都比左边短；`first_difference` 给出从 1 计的差异位置、缺失侧为 `null`，并保留事件在各自**原轨迹步号**（这里 `b2` 在左轨迹中是第 2 步）：
+
+```bash
+P=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTO" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$P/transitions \
+  -H 'Content-Type: application/json' -d '{"transition_id": "a1", "expected_version": 0}'
+curl -s -X POST http://localhost:8000/v1/trace-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\": \"$L\", \"right_session_id\": \"$P\", \
+\"left_expected_version\": 4, \"right_expected_version\": 1}"
+```
+
+```json
+{
+  "left_session_id": "…左…",
+  "right_session_id": "…前缀…",
+  "left_version": 4,
+  "right_version": 1,
+  "directions": {
+    "A_to_B": {
+      "left_event_count": 2, "right_event_count": 1, "result": "right_prefix",
+      "first_difference": {
+        "position": 2,
+        "left_event":  { "action": "receive", "message": "m" },
+        "right_event": null,
+        "left_step":  { "index": 3, "transition_id": "b1" },
+        "right_step": null
+      }
+    },
+    "B_to_A": {
+      "left_event_count": 2, "right_event_count": 0, "result": "right_prefix",
+      "first_difference": {
+        "position": 1,
+        "left_event":  { "action": "send", "message": "n" },
+        "right_event": null,
+        "left_step":  { "index": 2, "transition_id": "b2" },
+        "right_step": null
+      }
+    }
+  }
+}
+```
+
+分歧：在同样的初始配置下让 B 改发另一条消息（另建会话，只走 `a1, b3, a3, b1`，其中 `b3`/`a3` 收发消息 `p`），A→B 仍相同，B→A 在第 1 个事件处分歧，双方事件与各自原轨迹步号、转移 ID 一并给出：
+
+```bash
+PROTOP='{
+  "A": { "states": [0, 1, 2], "initial": 0, "finals": [2] },
+  "B": { "states": [0, 1, 2], "initial": 0, "finals": [2] },
+  "transitions": [
+    { "id": "a1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "b1", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 1, "target": 2 },
+    { "id": "b3", "from": "B", "to": "A", "action": "send",    "message": "p", "source": 0, "target": 1 },
+    { "id": "a3", "from": "B", "to": "A", "action": "receive", "message": "p", "source": 1, "target": 2 }
+  ]
+}'
+D=$(curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$PROTOP" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for step in 'a1 0' 'b3 1' 'a3 2' 'b1 3'; do set -- $step
+  curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$D/transitions \
+    -H 'Content-Type: application/json' \
+    -d "{\"transition_id\": \"$1\", \"expected_version\": $2}"; done
+curl -s -X POST http://localhost:8000/v1/trace-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\": \"$L\", \"right_session_id\": \"$D\", \
+\"left_expected_version\": 4, \"right_expected_version\": 4}"
+```
+
+```json
+{
+  "left_version": 4, "right_version": 4,
+  "directions": {
+    "A_to_B": { "left_event_count": 2, "right_event_count": 2, "result": "equal", "first_difference": null },
+    "B_to_A": {
+      "left_event_count": 2, "right_event_count": 2, "result": "divergent",
+      "first_difference": {
+        "position": 1,
+        "left_event":  { "action": "send", "message": "n" },
+        "right_event": { "action": "send", "message": "p" },
+        "left_step":  { "index": 2, "transition_id": "b2" },
+        "right_step": { "index": 2, "transition_id": "b3" }
+      }
+    }
+  }
+}
+```
+
+两边携带**不同协议**也允许比较（各自按自己的当前协议重放，只比 `action`/`message`，转移 ID 忽略）。错误示例：
+
+```bash
+# 预期版本过期：detail 指出过期侧、会话 ID 与当前版本 -> 409
+curl -s -i -X POST http://localhost:8000/v1/trace-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\": \"$L\", \"right_session_id\": \"$R\", \
+\"left_expected_version\": 3, \"right_expected_version\": 4}"
+# {"detail":{"error":"version_conflict","current_version":4,"session":"left","session_id":"…"}}
+
+# 未知会话 -> 404
+curl -s -i -X POST http://localhost:8000/v1/trace-comparisons \
+  -H 'Content-Type: application/json' \
+  -d '{"left_session_id":"does-not-exist","right_session_id":"'"$R"'",\
+"left_expected_version":0,"right_expected_version":4}'
+# {"detail":"unknown session"}
+
+# 同一个会话 ID 与自身对比（两个预期版本都要等于当前版本）
+curl -s -X POST http://localhost:8000/v1/trace-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\": \"$L\", \"right_session_id\": \"$L\", \
+\"left_expected_version\": 4, \"right_expected_version\": 4}"
+# 两个方向均 equal；对比不修改任何数据、不消耗版本
+```
+
+以 2 个 worker 运行时，对任一会话的对比若与其执行转移、替换协议或接回并发：每个对比要么读到指定版本的**完整轨迹**（`200`），要么以 `session` 标明过期侧返回 `409`，响应绝不会混入随后提交的步骤；对比本身始终只读。
+
+## 存储位置与卷保留规则
 
 - 数据库文件：容器内 **`/data/sessions.db`**（WAL 模式，运行时可能伴随 `-wal` / `-shm` 文件），可用环境变量 `SESSIONS_DB` 覆盖；本地开发缺省为工作目录下的 `./sessions.db`。
 - Compose 命名卷 `sessions-data` 挂载到 `/data`；首次挂载时卷会继承镜像中 `/data` 的属主（运行用户 `nobody`），保证运行用户可写。服务启动时自动建库建表。
@@ -1047,5 +1252,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ├── Dockerfile
 ├── docker-compose.yml
 ├── README.md
-└── requirements.txt
+├── requirements.txt
+├── test_sessions.py        # 会话执行/替换/分支/接回端到端检查
+└── test_comparisons.py     # 两次演练轨迹对比端到端检查
 ```

@@ -250,6 +250,58 @@ class AdoptionRequest(BaseModel):
     source_expected_version: Annotated[int, Field(ge=0)]
 
 
+class TraceComparisonRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # The two sessions may be the very same id and may carry different
+    # protocols; only the replayed (action, message) events are compared.
+    left_session_id: NonEmptyId
+    right_session_id: NonEmptyId
+    left_expected_version: Annotated[int, Field(ge=0)]
+    right_expected_version: Annotated[int, Field(ge=0)]
+
+
+class ComparisonEvent(BaseModel):
+    # Only these two fields participate in the comparison.
+    action: Literal["send", "receive"]
+    message: str
+
+
+class ComparisonStepRef(BaseModel):
+    # Where the event came from in that side's own replayed trace; reported for
+    # context only and ignored by the comparison.
+    index: int
+    transition_id: str
+
+
+class DirectionDifference(BaseModel):
+    position: int
+    left_event: ComparisonEvent | None
+    right_event: ComparisonEvent | None
+    left_step: ComparisonStepRef | None
+    right_step: ComparisonStepRef | None
+
+
+class DirectionComparison(BaseModel):
+    left_event_count: int
+    right_event_count: int
+    result: Literal["equal", "left_prefix", "right_prefix", "divergent"]
+    first_difference: DirectionDifference | None
+
+
+class ComparisonDirections(BaseModel):
+    A_to_B: DirectionComparison
+    B_to_A: DirectionComparison
+
+
+class TraceComparisonResponse(BaseModel):
+    left_session_id: str
+    right_session_id: str
+    left_version: int
+    right_version: int
+    directions: ComparisonDirections
+
+
 class SessionView(BaseModel):
     id: str
     version: int
