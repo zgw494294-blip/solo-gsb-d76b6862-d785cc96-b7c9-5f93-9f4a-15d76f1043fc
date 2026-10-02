@@ -39,6 +39,16 @@ same committed snapshot, so concurrent modification of either session ends in
 either accepting that exact complete outcome or answering 409 — acceptance,
 execution and protocol replacement on one target version are mutually
 exclusive. Any failure raises before commit and leaves both sessions untouched.
+
+Two sessions can also be compared without writing anything. Each stored trace
+is replayed against that session's own (possibly different) current protocol,
+and every step is projected onto its message direction as an ``(action,
+message)`` pair — A→B and B→A each keep their own order, while transition ids,
+endpoint states/queues and the interleaving between the two directions are
+ignored. Both rows are read inside one read transaction, so the two snapshots
+always belong to the same committed state: when either named expected version
+is stale the comparison answers 409 instead of mixing revisions; an unknown id
+answers 404.
 """
 
 import json
@@ -369,6 +379,178 @@ def adopt_trace(
         raise
     finally:
         connection.close()
+
+
+def compare_sessions(
+    left_session_id: str,
+    right_session_id: str,
+    left_expected_version: int,
+    right_expected_version: int,
+) -> dict:
+    """Compare two sessions by their per-direction action/message streams.
+
+    Each trace is replayed against the row's own current protocol, and every
+    step becomes an ``(action, message)`` event in the direction of its
+    message flow (A→B or B→A), preserving the original order within one
+    direction. Transition ids, endpoint states, queues and the interleaving
+    between the two directions never enter the comparison; the two sessions
+    may therefore run entirely different protocols and may even be the same
+    id.
+
+    Both rows are read inside one read transaction. In WAL mode a read
+    transaction observes one consistent committed snapshot for every
+    statement, so the two rows always come from the same committed state even
+    when another worker commits mid-request: the response is either the
+    complete comparison at the two named versions or a 409 naming the stale
+    side (checked left first), never a mix of revisions. The comparison does
+    not write and consumes no version.
+    """
+    connection = _connect()
+    try:
+        # A plain (deferred) transaction takes no write lock; both SELECTs
+        # share the one read snapshot established by the first read.
+        connection.execute("BEGIN")
+        left_row = connection.execute(
+            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            (left_session_id,),
+        ).fetchone()
+        right_row = connection.execute(
+            "SELECT version, protocol, trace_ids FROM sessions WHERE id = ?",
+            (right_session_id,),
+        ).fetchone()
+
+        # Unknown sessions take precedence over staleness (same convention as
+        # the mutating endpoints); the left side is reported first.
+        if left_row is None or right_row is None:
+            raise HTTPException(status_code=404, detail="unknown session")
+
+        left_version, left_protocol_text, left_trace_text = left_row
+        right_version, right_protocol_text, right_trace_text = right_row
+
+        if left_version != left_expected_version:
+            raise _comparison_conflict(
+                left_version, side="left", session_id=left_session_id
+            )
+        if right_version != right_expected_version:
+            raise _comparison_conflict(
+                right_version, side="right", session_id=right_session_id
+            )
+
+        left_events = _direction_events(
+            DeadlockRequest.model_validate(json.loads(left_protocol_text)),
+            json.loads(left_trace_text),
+        )
+        right_events = _direction_events(
+            DeadlockRequest.model_validate(json.loads(right_protocol_text)),
+            json.loads(right_trace_text),
+        )
+
+        return {
+            "left_session_id": left_session_id,
+            "right_session_id": right_session_id,
+            "left_version": left_version,
+            "right_version": right_version,
+            **{
+                direction: _compare_directions(
+                    left_events[direction], right_events[direction]
+                )
+                for direction in ("A_to_B", "B_to_A")
+            },
+        }
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _direction_events(protocol, trace_ids: list[str]) -> dict[str, list[dict]]:
+    """Replay the trace under this protocol and project it onto directions.
+
+    The trace is one the session already validated under this protocol, so
+    every stored id exists and every step is fireable; replay only resolves
+    the observable action/message pair and the message direction of each
+    step. Only ``from``/``to`` decide the bucket — a step that sends A→B and
+    a later step receiving the same message both land in ``A_to_B``.
+    """
+    model = build_model(protocol)
+    by_id = {transition.id: transition for transition in model.transitions}
+
+    events: dict[str, list[dict]] = {"A_to_B": [], "B_to_A": []}
+    for index, transition_id in enumerate(trace_ids, start=1):
+        transition = by_id[transition_id]
+        direction = (
+            "A_to_B"
+            if (transition.sender, transition.receiver) == ("A", "B")
+            else "B_to_A"
+        )
+        events[direction].append(
+            {
+                "action": transition.action,
+                "message": transition.message,
+                "trace_step": index,
+                "transition_id": transition.id,
+            }
+        )
+    return events
+
+
+def _compare_directions(left: list[dict], right: list[dict]) -> dict:
+    """Compare two one-direction event streams by action/message pairs only."""
+    shared = min(len(left), len(right))
+    first_different = next(
+        (
+            index
+            for index in range(shared)
+            if (left[index]["action"], left[index]["message"])
+            != (right[index]["action"], right[index]["message"])
+        ),
+        None,
+    )
+
+    if first_different is not None:
+        relation = "divergent"
+        difference = _difference_view(first_different + 1,
+                                      left[first_different],
+                                      right[first_different])
+    elif len(left) == len(right):
+        relation = "equal"
+        difference = None
+    else:
+        # All shared pairs match and the lengths differ: the shorter stream is
+        # a strict prefix. The first difference is the longer side's next
+        # event; the missing side reports null.
+        position = shared + 1
+        if len(right) > len(left):
+            relation = "left_is_strict_prefix"
+            difference = _difference_view(position, None, right[shared])
+        else:
+            relation = "right_is_strict_prefix"
+            difference = _difference_view(position, left[shared], None)
+
+    return {
+        "left_event_count": len(left),
+        "right_event_count": len(right),
+        "relation": relation,
+        "first_difference": difference,
+    }
+
+
+def _difference_view(position: int, left: dict | None, right: dict | None) -> dict:
+    return {"position": position, "left": left, "right": right}
+
+
+def _comparison_conflict(current_version: int, side: str,
+                         session_id: str) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "version_conflict",
+            "current_version": current_version,
+            "side": side,
+            "session_id": session_id,
+        },
+    )
 
 
 def _update_session(session_id: str, mutate) -> dict:

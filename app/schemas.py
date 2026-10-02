@@ -250,6 +250,19 @@ class AdoptionRequest(BaseModel):
     source_expected_version: Annotated[int, Field(ge=0)]
 
 
+class SessionComparisonRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # Two sessions compared purely by the per-direction action/message streams
+    # obtained by replaying their own current protocols. The same id may be
+    # named twice (a session compares equal to itself), and the two protocols
+    # may differ entirely — transition ids, states and queues never take part.
+    left_session_id: NonEmptyId
+    right_session_id: NonEmptyId
+    left_expected_version: Annotated[int, Field(ge=0)]
+    right_expected_version: Annotated[int, Field(ge=0)]
+
+
 class SessionView(BaseModel):
     id: str
     version: int
@@ -257,3 +270,44 @@ class SessionView(BaseModel):
     configuration: ConfigurationView
     trace: list[PathStep]
     enabled_transition_ids: list[str]
+
+
+class ComparisonEvent(BaseModel):
+    # One element of a per-direction event stream: only the observable message
+    # exchange (the action and its message), located back to the original
+    # trace for error reporting.
+    action: Literal["send", "receive"]
+    message: str
+    trace_step: int
+    transition_id: str
+
+
+class DirectionalDifference(BaseModel):
+    # Position in the per-direction streams, counted from 1. A strict prefix
+    # reports the first position the missing side never reached.
+    position: int
+    left: ComparisonEvent | None
+    right: ComparisonEvent | None
+
+
+class DirectionComparison(BaseModel):
+    # Comparison of one message direction (A_to_B or B_to_A), ignoring how the
+    # two directions were interleaved in the original traces.
+    left_event_count: int
+    right_event_count: int
+    relation: Literal[
+        "equal",
+        "left_is_strict_prefix",
+        "right_is_strict_prefix",
+        "divergent",
+    ]
+    first_difference: DirectionalDifference | None = None
+
+
+class SessionComparisonResponse(BaseModel):
+    left_session_id: str
+    right_session_id: str
+    left_version: int
+    right_version: int
+    A_to_B: DirectionComparison
+    B_to_A: DirectionComparison

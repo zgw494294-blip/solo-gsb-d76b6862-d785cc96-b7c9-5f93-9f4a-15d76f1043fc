@@ -574,7 +574,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 
 ## 双端协议演练会话
 
-除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。
+除上述四个离线分析接口外，服务还提供**有状态演练会话**：创建会话后可以逐个执行转移、随时查询当前配置与完整执行轨迹，也可以修改协议后从新初态重放已执行步骤，继续演练；还可以从指定轨迹位置另开**分支会话**，两边独立续演；另一会话中已走通的后续轨迹也可以直接**接回**目标会话，免去逐步重演。两次演练还可以按方向**对比消息交换**：只比较各自 `(action, message)` 序列，忽略转移 ID、端点状态与两方向之间的交错。
 
 - 会话（协议、轨迹 ID、版本）持久化在**本地 SQLite 数据库**中，所有进程共享同一文件：服务或容器重建后仍可按原会话 ID 查询并继续执行、替换协议，版本不会回退。
 - 服务默认以 **2 个 Uvicorn worker** 进程运行，启动时自动建库建表（无需迁移旧数据）。
@@ -592,6 +592,7 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 | `PUT` | `/v1/sessions/{id}/protocol` | 替换完整协议，请求体 `{"protocol": {...}, "expected_version": ...}` |
 | `POST` | `/v1/sessions/{id}/branches` | 从指定轨迹位置另开分支会话，请求体 `{"expected_version": ..., "prefix_length": ...}`，返回新会话视图（版本 0） |
 | `POST` | `/v1/sessions/{id}/adoptions` | 把来源会话的后续轨迹接回本目标会话，请求体 `{"source_session_id": ..., "target_expected_version": ..., "source_expected_version": ...}` |
+| `POST` | `/v1/session-comparisons` | 按消息方向对比两次演练（只读、不改数据与版本），请求体 `{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}` |
 
 响应均为同一会话视图：
 
@@ -608,6 +609,8 @@ curl -X POST http://localhost:8000/v1/deactivation-plans \
 - `404`：未知会话（接回时目标或来源任一未知）；
 - `409`：`expected_version` 过期、转移在当前配置下不可执行（含 ID 不存在）、或会话已处于完成配置；接回时还包括目标或来源版本过期——响应体在通用 `current_version` 之外以 `session`（`"target"`/`"source"`）与 `session_id` 指出是哪个会话过期；
 - `422`：请求体不合法（复用原协议校验，规则同下节）；替换协议时还包括**重放失败**——从新协议初态按已执行 ID 重放时，任一步不可执行或在轨迹结束前到达完成配置，响应体 `detail.first_failed_step` 给出从 1 计的首个失败步；分支时还包括 `prefix_length` 非法（布尔值、非整数、负数或超过当前轨迹长度）；接回时还包括：目标与来源是同一会话（`same_session`）、两边协议字段值或列表顺序不同（`protocol_mismatch`）、目标轨迹 ID 序列不是来源轨迹的严格前缀（`trace_not_strict_prefix`）。
+
+对比接口为只读操作，状态码：成功 `200`；任一会话 ID 未知返回 `404`；左或右的期望版本过期返回 `409`，响应体在通用 `current_version` 之外以 `side`（`"left"`/`"right"`）与 `session_id` 指出过期侧（左侧优先判定）；请求体不合法返回 `422`。对比不修改任何会话、不消耗版本。
 
 替换协议允许改变已有 ID 的转移定义（端点状态、消息、source/target 等），但重放时每一步都必须在新协议下可执行，且不能在轨迹结束前到达完成配置；重放成功后轨迹与当前配置全部按新协议重算。完成配置只禁止继续执行转移，不禁止替换协议。
 
@@ -938,6 +941,147 @@ curl -s -i -X POST http://localhost:8000/v1/sessions/does-not-exist/adoptions \
 ```
 
 以上任何失败都不改数据：两个会话的版本、协议与轨迹保持原样，可用 `GET /v1/sessions/{id}` 复核。
+
+### 两次演练对比：`POST /v1/session-comparisons`
+
+对比两次演练，**区分消息交换本身的变化与双方向之间的交错次序差异**：
+
+- 请求体给出左、右两个会话 ID 及各自的期望版本：`{"left_session_id": ..., "right_session_id": ..., "left_expected_version": ..., "right_expected_version": ...}`。左右**可以是同一会话 ID**（会话与自身比较必为相同），两边的**协议也可以完全不同**。
+- 服务把每个会话的轨迹 ID 按**各自当前协议**重放，把每步投影成该消息方向上的一个 `(action, message)` 事件：
+  - 按消息流向分成 **A→B**（`"A_to_B"`）与 **B→A**（`"B_to_A"`）两条序列，每条**保留原轨迹中的先后顺序**（发送与接收该消息的步骤进入同一条）；
+  - 比较**只看 `action` 与 `message`**，忽略转移 ID、执行后端点状态/队列，以及两个方向之间的交错次序——因此两次演练即使步骤交错完全不同，只要每个方向上的动作/消息序列一致，就判为相同。
+- 每个方向独立返回 `left_event_count`、`right_event_count` 与 `relation`，取值：
+  - `"equal"`：两条序列逐项相同（含两边皆空），`first_difference` 为 `null`；
+  - `"left_is_strict_prefix"`：左侧是右侧的严格前缀（右侧还继续）；
+  - `"right_is_strict_prefix"`：右侧是左侧的严格前缀（左侧还继续）；
+  - `"divergent"`：共有位置上出现首个不同的动作/消息。
+- `first_difference` 给出**从 1 计的首个差异位置**：`position` 是该方向序列中的位置；`left`、`right` 分别是双方在该位置的事件（`action`、`message`，以及定位用的原轨迹步号 `trace_step` 与 `transition_id`），缺失侧为 `null`；`"equal"` 时整个字段为 `null`。严格前缀的首个差异位置为「较短长度 + 1」，缺失侧为 `null`。
+- 响应同时回显所用的 `left_session_id`、`right_session_id`、`left_version`、`right_version`；接口**只读**，不改动任何数据或版本。
+- 两个会话行在**同一个读事务**内读取：在 WAL 模式下整个事务只观察同一份已提交快照，因此两边必然来自同一已提交状态。与执行转移、协议替换或接回并发时，请求要么基于指定版本的**完整轨迹**给出比较，要么返回 `409`，`detail` 以 `side`（`"left"`/`"right"`，左侧先判定）、`session_id` 与 `current_version` 指出过期侧；响应绝不会混入随后提交的步骤。任一会话 ID 未知返回 `404`。
+
+#### 可执行示例：交错不同、消息交换相同（端口 8000）
+
+下面的协议每个方向各有一次发送/接收，且发送步骤在状态 `0` 自环，所以「先 A→B 还是先 B→A」都合法。两次演练的轨迹交错不同，但每个方向上的 `(action, message)` 序列完全一致。
+
+```bash
+INTER='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "sAB", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 0 },
+    { "id": "rAB", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 },
+    { "id": "sBA", "from": "B", "to": "A", "action": "send",    "message": "n", "source": 0, "target": 0 },
+    { "id": "rBA", "from": "B", "to": "A", "action": "receive", "message": "n", "source": 0, "target": 1 }
+  ]
+}'
+mk() { curl -s -X POST http://localhost:8000/v1/sessions -H 'Content-Type: application/json' -d "$1" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])'; }
+ex() { curl -s -o /dev/null -X POST http://localhost:8000/v1/sessions/$1/transitions \
+  -H 'Content-Type: application/json' -d "{\"transition_id\":\"$2\",\"expected_version\":$3}"; }
+
+L=$(mk "$INTER"); R=$(mk "$INTER")
+# 左：sAB sBA rAB rBA —— 交错次序 A先
+ex $L sAB 0; ex $L sBA 1; ex $L rAB 2; ex $L rBA 3
+# 右：sBA sAB rBA rAB —— 交错次序 B先
+ex $R sBA 0; ex $R sAB 1; ex $R rBA 2; ex $R rAB 3
+
+curl -s -X POST http://localhost:8000/v1/session-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\":\"$L\",\"right_session_id\":\"$R\",\"left_expected_version\":4,\"right_expected_version\":4}"
+```
+
+两个方向各自的动作/消息序列都是先发送后接收，交错被忽略，结果两个方向都为 `equal`：
+
+```json
+{
+  "left_session_id": "…L…",
+  "right_session_id": "…R…",
+  "left_version": 4,
+  "right_version": 4,
+  "A_to_B": {
+    "left_event_count": 2,
+    "right_event_count": 2,
+    "relation": "equal",
+    "first_difference": null
+  },
+  "B_to_A": {
+    "left_event_count": 2,
+    "right_event_count": 2,
+    "relation": "equal",
+    "first_difference": null
+  }
+}
+```
+
+#### 可执行示例：严格前缀与分歧
+
+左会话只执行 `t1`（A→B 发送 `m`，版本 `1`），右会话执行 `t1, t4`（发送后接收，版本 `2`）：
+
+```bash
+PROTO='{
+  "A": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "B": { "states": [0, 1], "initial": 0, "finals": [1] },
+  "transitions": [
+    { "id": "t1", "from": "A", "to": "B", "action": "send",    "message": "m", "source": 0, "target": 1 },
+    { "id": "t4", "from": "A", "to": "B", "action": "receive", "message": "m", "source": 0, "target": 1 }
+  ]
+}'
+L=$(mk "$PROTO"); R=$(mk "$PROTO")
+ex $L t1 0
+ex $R t1 0; ex $R t4 1
+
+curl -s -X POST http://localhost:8000/v1/session-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\":\"$L\",\"right_session_id\":\"$R\",\"left_expected_version\":1,\"right_expected_version\":2}"
+```
+
+A→B 方向左侧是右侧的严格前缀，首个差异位置 `2` 上左侧缺失（`null`），右侧事件回指原轨迹第 2 步；B→A 方向两边皆空、判为 `equal`：
+
+```json
+{
+  "left_session_id": "…L…",
+  "right_session_id": "…R…",
+  "left_version": 1,
+  "right_version": 2,
+  "A_to_B": {
+    "left_event_count": 1,
+    "right_event_count": 2,
+    "relation": "left_is_strict_prefix",
+    "first_difference": {
+      "position": 2,
+      "left": null,
+      "right": { "action": "receive", "message": "m", "trace_step": 2, "transition_id": "t4" }
+    }
+  },
+  "B_to_A": {
+    "left_event_count": 0,
+    "right_event_count": 0,
+    "relation": "equal",
+    "first_difference": null
+  }
+}
+```
+
+左右允许使用**不同协议**：例如右侧把消息由 `"m"` 改成 `"ZZ"`（转移 ID 相同也不影响比较），则 A→B 方向在位置 `1` 即分歧，`first_difference.left` / `.right` 给出双方事件及其原轨迹步号与转移 ID。把左右对调请求即可得到 `"right_is_strict_prefix"`；两边 ID 相同（会话与自身比较）时两方向都为 `"equal"`。
+
+版本过期与未知会话：
+
+```bash
+# 左侧期望版本过期（当前为 1，却传 0）-> 409，side 指出过期侧
+curl -s -i -X POST http://localhost:8000/v1/session-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\":\"$L\",\"right_session_id\":\"$R\",\"left_expected_version\":0,\"right_expected_version\":2}"
+# HTTP/1.1 409 Conflict
+# {"detail":{"error":"version_conflict","current_version":1,"side":"left","session_id":"…L…"}}
+
+# 任一会话 ID 未知 -> 404 {"detail":"unknown session"}
+curl -s -i -X POST http://localhost:8000/v1/session-comparisons \
+  -H 'Content-Type: application/json' \
+  -d "{\"left_session_id\":\"does-not-exist\",\"right_session_id\":\"$R\",\"left_expected_version\":0,\"right_expected_version\":2}"
+# HTTP/1.1 404 Not Found
+```
+
+对比不写任何数据：调用后用 `GET /v1/sessions/{id}` 复核，两个会话的版本与轨迹均不变。并发场景下（2 个 worker），对比与执行/替换/接回同时进行时，每个对比要么返回指定版本的完整结果，要么返回 `409`，不会返回跨版本拼凑的轨迹。
 
 #### 可执行示例：同目标版本的并发只成一项
 

@@ -17,6 +17,8 @@ from .schemas import (
     GuaranteeRequest,
     GuaranteeResponse,
     ProtocolReplaceRequest,
+    SessionComparisonRequest,
+    SessionComparisonResponse,
     SessionCreateRequest,
     SessionView,
 )
@@ -32,7 +34,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Offline Two-Party Message Protocol Deadlock Analyzer",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -105,4 +107,14 @@ def adopt_session_trace(session_id: str, request: AdoptionRequest) -> dict:
         request.source_session_id,
         request.target_expected_version,
         request.source_expected_version,
+    )
+
+
+@app.post("/v1/session-comparisons", response_model=SessionComparisonResponse)
+def compare_session_traces(request: SessionComparisonRequest) -> dict:
+    return sessions.compare_sessions(
+        request.left_session_id,
+        request.right_session_id,
+        request.left_expected_version,
+        request.right_expected_version,
     )
